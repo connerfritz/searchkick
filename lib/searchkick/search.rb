@@ -2,22 +2,13 @@ module Searchkick
   module Search
 
     def search(term, options = {})
-      if term.is_a?(Hash)
-        options = term
-        term = nil
-      else
-        term = term.to_s
-      end
-
+      term = term.to_s
       fields =
         if options[:fields]
           if options[:autocomplete]
             options[:fields].map{|f| "#{f}.autocomplete" }
           else
-            options[:fields].map do |value|
-              k, v = value.is_a?(Hash) ? value.to_a.first : [value, :word]
-              "#{k}.#{v == :word ? "analyzed" : v}"
-            end
+            options[:fields].map{|f| "#{f}.analyzed" }
           end
         else
           if options[:autocomplete]
@@ -44,9 +35,7 @@ module Searchkick
 
       all = term == "*"
 
-      if options[:query]
-        payload = options[:query]
-      elsif options[:similar]
+      if options[:similar]
         payload = {
           more_like_this: {
             fields: fields,
@@ -70,39 +59,23 @@ module Searchkick
             }
           }
         else
-          queries = []
-          fields.each do |field|
-            if field == "_all" or field.end_with?(".analyzed")
-              shared_options = {
-                fields: [field],
-                query: term,
-                use_dis_max: false,
-                operator: operator,
-                cutoff_frequency: 0.001
-              }
-              queries.concat [
-                {multi_match: shared_options.merge(boost: 10, analyzer: "searchkick_search")},
-                {multi_match: shared_options.merge(boost: 10, analyzer: "searchkick_search2")}
-              ]
-              if options[:misspellings] != false
-                distance = (options[:misspellings].is_a?(Hash) && options[:misspellings][:distance]) || 1
-                queries.concat [
-                  {multi_match: shared_options.merge(fuzziness: distance, max_expansions: 3, analyzer: "searchkick_search")},
-                  {multi_match: shared_options.merge(fuzziness: distance, max_expansions: 3, analyzer: "searchkick_search2")}
-                ]
-              end
-            else
-              analyzer = field.match(/\.word_(start|middle|end)\z/) ? "searchkick_word_search" : "searchkick_autocomplete_search"
-              queries << {
-                multi_match: {
-                  fields: [field],
-                  query: term,
-                  analyzer: analyzer
-                }
-              }
-            end
+          shared_options = {
+            fields: fields,
+            query: term,
+            use_dis_max: false,
+            operator: operator
+          }
+          queries = [
+            {multi_match: shared_options.merge(boost: 10, analyzer: "searchkick_search")},
+            {multi_match: shared_options.merge(boost: 10, analyzer: "searchkick_search2")}
+          ]
+          if options[:misspellings] != false
+            distance = (options[:misspellings].is_a?(Hash) && options[:misspellings][:distance]) || 1
+            queries.concat [
+              {multi_match: shared_options.merge(fuzziness: distance, max_expansions: 3, analyzer: "searchkick_search")},
+              {multi_match: shared_options.merge(fuzziness: distance, max_expansions: 3, analyzer: "searchkick_search2")}
+            ]
           end
-
           payload = {
             dis_max: {
               queries: queries
@@ -160,15 +133,6 @@ module Searchkick
         }
       end
 
-      if options[:personalize]
-        custom_filters << {
-          filter: {
-            term: options[:personalize]
-          },
-          boost: 100
-        }
-      end
-
       if custom_filters.any?
         payload = {
           custom_filters_score: {
@@ -189,23 +153,8 @@ module Searchkick
       # order
       if options[:order]
         order = options[:order].is_a?(Enumerable) ? options[:order] : {options[:order] => :asc}
-        payload[:sort] = Hash[ order.map{|k, v| [k.to_s == "id" ? :_id : k, v] } ]
+        payload[:sort] = order
       end
-
-      term_filters =
-        proc do |field, value|
-          if value.is_a?(Array) # in query
-            if value.any?
-              {or: value.map{|v| term_filters.call(field, v) }}
-            else
-              {terms: {field => value}} # match nothing
-            end
-          elsif value.nil?
-            {missing: {"field" => field, existence: true, null_value: true}}
-          else
-            {term: {field => value}}
-          end
-        end
 
       # where
       where_filters =
@@ -224,30 +173,37 @@ module Searchkick
                 value = {gte: value.first, (value.exclude_end? ? :lt : :lte) => value.last}
               end
 
-              if value.is_a?(Hash)
+              if value.is_a?(Array) # in query
+                filters << {terms: {field => value}}
+              elsif value.is_a?(Hash)
+                if value[:near]
+                  filters << {
+                    geo_distance: {
+                      field => value[:near].map(&:to_f).reverse,
+                      distance: value[:within] || "50mi"
+                    }
+                  }
+                end
+
+                if value[:top_left]
+                  filters << {
+                    geo_bounding_box: {
+                      field => {
+                        top_left: value[:top_left].map(&:to_f).reverse,
+                        bottom_right: value[:bottom_right].map(&:to_f).reverse
+                      }
+                    }
+                  }
+                end
+
                 value.each do |op, op_value|
-                  case op
-                  when :within, :bottom_right
-                    # do nothing
-                  when :near
-                    filters << {
-                      geo_distance: {
-                        field => op_value.map(&:to_f).reverse,
-                        distance: value[:within] || "50mi"
-                      }
-                    }
-                  when :top_left
-                    filters << {
-                      geo_bounding_box: {
-                        field => {
-                          top_left: op_value.map(&:to_f).reverse,
-                          bottom_right: value[:bottom_right].map(&:to_f).reverse
-                        }
-                      }
-                    }
-                  when :not # not equal
-                    filters << {not: term_filters.call(field, op_value)}
-                  when :all
+                  if op == :not # not equal
+                    if op_value.is_a?(Array)
+                      filters << {not: {terms: {field => op_value}}}
+                    else
+                      filters << {not: {term: {field => op_value}}}
+                    end
+                  elsif op == :all
                     filters << {terms: {field => op_value, execution: "and"}}
                   else
                     range_query =
@@ -260,19 +216,26 @@ module Searchkick
                         {to: op_value, include_upper: false}
                       when :lte
                         {to: op_value, include_upper: true}
+                      when :near
+                        next
+                      when :within
+                        next
+                      when :top_left
+                        next
+                      when :bottom_right
+                        next
                       else
                         raise "Unknown where operator"
                       end
-                    # issue 132
-                    if existing = filters.find{ |f| f[:range] && f[:range][field] }
-                      existing[:range][field].merge!(range_query)
-                    else
-                      filters << {range: {field => range_query}}
-                    end
+                    filters << {range: {field => range_query}}
                   end
                 end
               else
-                filters << term_filters.call(field, value)
+                if value.nil?
+                  filters << {missing: {"field" => field, existence: true, null_value: true}}
+                else
+                  filters << {term: {field => value}}
+                end
               end
             end
           end
@@ -320,7 +283,9 @@ module Searchkick
           # offset is not possible
           # http://elasticsearch-users.115913.n3.nabble.com/Is-pagination-possible-in-termsStatsFacet-td3422943.html
 
+          facet_options.deep_merge!(where: options[:where].reject{|k| k == field}) if options[:include_constraints] == true
           facet_filters = where_filters.call(facet_options[:where])
+
           if facet_filters.any?
             payload[:facets][field][:facet_filter] = {
               and: {
@@ -364,9 +329,7 @@ module Searchkick
       payload[:fields] = [] if load
 
       tire_options = {load: load, payload: payload, size: per_page, from: offset}
-      if options[:type] or self != searchkick_klass
-        tire_options[:type] = [options[:type] || self].flatten.map(&:document_type)
-      end
+      tire_options[:type] = document_type if self != searchkick_klass
       search = Tire::Search::Search.new(index_name, tire_options)
       begin
         response = search.json
